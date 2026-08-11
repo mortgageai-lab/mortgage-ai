@@ -1,0 +1,13 @@
+# Local secrets
+.env
+
+# Local client data — never upload to GitHub
+Deals/
+data/
+
+# Python virtual environments and generated files
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.swp
