@@ -21,6 +21,8 @@ from aiogram.types import Message
 from dotenv import load_dotenv
 from PIL import Image, ImageOps
 
+from news_monitor import NewsStore, format_rate_report
+
 
 load_dotenv()
 
@@ -29,12 +31,14 @@ PROJECT_DIRECTORY = Path(__file__).resolve().parent
 DEALS_DIRECTORY = PROJECT_DIRECTORY / "Deals"
 DATA_DIRECTORY = PROJECT_DIRECTORY / "data"
 CHAT_DEALS_FILE = DATA_DIRECTORY / "chat_deals.json"
+NEWS_DATABASE_FILE = DATA_DIRECTORY / "mortgage_news.sqlite3"
 DEAL_METADATA_FILE = ".mortgage_ai_deal.json"
 PASSPORT_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".pdf"}
 MAX_PDF_PAGES_TO_SCAN = 2
 OCR_TIMEOUT_SECONDS = 12
 photo_album_buffers: dict[tuple[int, str], list[tuple[int, object]]] = {}
 photo_album_tasks: dict[tuple[int, str], asyncio.Task[None]] = {}
+news_store = NewsStore(NEWS_DATABASE_FILE)
 
 
 class Feedback(StatesGroup):
@@ -410,6 +414,28 @@ async def my_id_handler(message: Message) -> None:
     if message.from_user is None:
         return
     await message.answer(f"Ваш технический Telegram ID: {message.from_user.id}")
+
+
+@dp.message(Command("rates"))
+async def rates_handler(message: Message) -> None:
+    """Show the latest rate mentions collected from configured channels."""
+    if not is_team_member(message):
+        return
+    report = await asyncio.to_thread(
+        format_rate_report, news_store.latest_rates(), "Текущая ситуация по ставкам"
+    )
+    await message.answer(report, disable_web_page_preview=True)
+
+
+@dp.message(Command("rate_changes"))
+async def rate_changes_handler(message: Message) -> None:
+    """Show rate mentions published during the last seven days."""
+    if not is_team_member(message):
+        return
+    report = await asyncio.to_thread(
+        format_rate_report, news_store.recent_changes(), "Изменения за последние 7 дней"
+    )
+    await message.answer(report, disable_web_page_preview=True)
 
 
 @dp.message(Feedback.waiting_for_rating, F.text)
