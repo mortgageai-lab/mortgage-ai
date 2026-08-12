@@ -1,9 +1,16 @@
 # Local secrets
 .env
+.env.*
+!.env.example
+credentials.json
+token.json
 
 # Local client data — never upload to GitHub
 Deals/
 data/
+outputs/
+*.session
+*.session-journal
 
 # Python virtual environments and generated files
 .venv/
