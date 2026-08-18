@@ -21,6 +21,7 @@ from aiogram.types import Message
 from dotenv import load_dotenv
 from PIL import Image, ImageOps
 
+from drive_storage import GoogleDriveStorage
 from news_monitor import NewsStore, format_rate_report
 
 
@@ -39,6 +40,7 @@ OCR_TIMEOUT_SECONDS = 12
 photo_album_buffers: dict[tuple[int, str], list[tuple[int, object]]] = {}
 photo_album_tasks: dict[tuple[int, str], asyncio.Task[None]] = {}
 news_store = NewsStore(NEWS_DATABASE_FILE)
+drive_storage = GoogleDriveStorage(PROJECT_DIRECTORY, DATA_DIRECTORY)
 
 
 class Feedback(StatesGroup):
@@ -333,7 +335,7 @@ def is_passport_photo_album(file_paths: list[Path]) -> bool:
 
 
 async def process_photo_album(
-    album_key: tuple[int, str], bot: Bot, documents_directory: Path
+    album_key: tuple[int, str], bot: Bot, documents_directory: Path, deal_id: str
 ) -> None:
     """Wait for an album to arrive, then save and recognize its pages together."""
     try:
@@ -361,13 +363,17 @@ async def process_photo_album(
             await bot.send_message(
                 album_key[0], f"Паспорт сохранён: {len(renamed_paths)} стр."
             )
+            for renamed_path in renamed_paths:
+                await asyncio.to_thread(drive_storage.upload_document, deal_id, renamed_path)
         else:
             await bot.send_message(album_key[0], f"Фотографии сохранены: {len(saved_paths)} шт.")
+            for saved_path in saved_paths:
+                await asyncio.to_thread(drive_storage.upload_document, deal_id, saved_path)
     except Exception:
         logging.exception("Could not process photo album")
 
 
-async def queue_photo_album(message: Message, documents_directory: Path) -> None:
+async def queue_photo_album(message: Message, documents_directory: Path, deal_id: str) -> None:
     """Collect all photos from one Telegram album before processing them."""
     if message.media_group_id is None or not message.photo:
         return
@@ -378,7 +384,7 @@ async def queue_photo_album(message: Message, documents_directory: Path) -> None
     if previous_task:
         previous_task.cancel()
     photo_album_tasks[album_key] = asyncio.create_task(
-        process_photo_album(album_key, message.bot, documents_directory)
+        process_photo_album(album_key, message.bot, documents_directory, deal_id)
     )
 
 
@@ -404,7 +410,12 @@ async def start_deal_handler(message: Message, state: FSMContext) -> None:
     chat_deals = load_chat_deals()
     chat_deals[str(message.chat.id)] = deal_id
     save_chat_deals(chat_deals)
+    drive_ready = await asyncio.to_thread(
+        drive_storage.ensure_deal_folders, deal_id, deal_folder.name
+    )
     await message.answer(f'Сделка создана. Папка "{deal_folder.name}"')
+    if drive_storage.enabled and not drive_ready:
+        await message.answer("Локальная папка создана. Google Drive временно недоступен.")
 
 
 @dp.message(Command("my_id"))
@@ -503,7 +514,12 @@ async def document_handler(message: Message) -> None:
     destination = unique_file_path(documents_directory, document.file_name or "document")
     await message.bot.download(document, destination=destination)
     renamed_path = await asyncio.to_thread(rename_recognized_document, destination)
-    await message.answer(f"Документ сохранён: {(renamed_path or destination).name}")
+    saved_path = renamed_path or destination
+    uploaded = await asyncio.to_thread(drive_storage.upload_document, deal_id, saved_path)
+    response = f"Документ сохранён: {saved_path.name}"
+    if drive_storage.enabled:
+        response += "\nКопия загружена в Google Drive." if uploaded else "\nЛокальная копия сохранена; Google Drive временно недоступен."
+    await message.answer(response)
 
 
 @dp.message(F.photo)
@@ -528,14 +544,19 @@ async def photo_handler(message: Message) -> None:
     documents_directory = deal_folder / "Documents"
     documents_directory.mkdir(exist_ok=True)
     if message.media_group_id:
-        await queue_photo_album(message, documents_directory)
+        await queue_photo_album(message, documents_directory, deal_id)
         return
 
     filename = f"photo_{datetime.now().strftime('%Y%m%d-%H%M%S')}.jpg"
     destination = unique_file_path(documents_directory, filename)
     await message.bot.download(photo, destination=destination)
     renamed_path = await asyncio.to_thread(rename_recognized_document, destination)
-    await message.answer(f"Фотография сохранена: {(renamed_path or destination).name}")
+    saved_path = renamed_path or destination
+    uploaded = await asyncio.to_thread(drive_storage.upload_document, deal_id, saved_path)
+    response = f"Фотография сохранена: {saved_path.name}"
+    if drive_storage.enabled:
+        response += "\nКопия загружена в Google Drive." if uploaded else "\nЛокальная копия сохранена; Google Drive временно недоступен."
+    await message.answer(response)
 
 
 @dp.message(F.text)

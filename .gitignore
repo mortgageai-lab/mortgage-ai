@@ -4,6 +4,9 @@
 !.env.example
 credentials.json
 token.json
+secrets/
+google-oauth-client.json
+google-oauth-token.json
 
 # Local client data — never upload to GitHub
 Deals/
