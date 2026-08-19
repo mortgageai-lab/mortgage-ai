@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -14,12 +15,13 @@ import fitz
 import pytesseract
 from aiogram import Bot, Dispatcher
 from aiogram import F
+from aiogram.enums import ChatMemberStatus
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message
+from aiogram.types import ChatMemberUpdated, Message
 from dotenv import load_dotenv
-from PIL import Image, ImageOps
+from PIL import Image, ImageFilter, ImageOps
 
 from drive_storage import GoogleDriveStorage
 from news_monitor import NewsStore, format_rate_report
@@ -32,11 +34,17 @@ PROJECT_DIRECTORY = Path(__file__).resolve().parent
 DEALS_DIRECTORY = PROJECT_DIRECTORY / "Deals"
 DATA_DIRECTORY = PROJECT_DIRECTORY / "data"
 CHAT_DEALS_FILE = DATA_DIRECTORY / "chat_deals.json"
+NOTIFICATION_CHAT_FILE = DATA_DIRECTORY / "notification_chat.json"
 NEWS_DATABASE_FILE = DATA_DIRECTORY / "mortgage_news.sqlite3"
 DEAL_METADATA_FILE = ".mortgage_ai_deal.json"
+CHAT_DOCUMENTS_FOLDER_NAME = "Документы из чата"
+LEGACY_DOCUMENTS_FOLDER_NAME = "Documents"
 PASSPORT_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".pdf"}
 MAX_PDF_PAGES_TO_SCAN = 2
 OCR_TIMEOUT_SECONDS = 12
+MAX_OCR_FILE_BYTES = 25 * 1024 * 1024
+MAX_SAVE_FILE_BYTES = 50 * 1024 * 1024
+MAX_OCR_IMAGE_PIXELS = 25_000_000
 photo_album_buffers: dict[tuple[int, str], list[tuple[int, object]]] = {}
 photo_album_tasks: dict[tuple[int, str], asyncio.Task[None]] = {}
 news_store = NewsStore(NEWS_DATABASE_FILE)
@@ -55,12 +63,27 @@ def create_deal_id() -> str:
     return f"DEAL-{timestamp}-{suffix}"
 
 
-def create_deal_folder(deal_id: str) -> Path:
+def unique_directory_path(directory: Path, folder_name: str) -> Path:
+    """Return a non-conflicting directory path without creating it."""
+    destination = directory / folder_name
+    if not destination.exists():
+        return destination
+
+    number = 2
+    while True:
+        destination = directory / f"{folder_name} ({number})"
+        if not destination.exists():
+            return destination
+        number += 1
+
+
+def create_deal_folder(deal_id: str, created_at: Optional[datetime] = None) -> Path:
     """Create a human-readable local folder and return its path."""
-    folder_name = datetime.now().strftime("%d.%m.%Y %H-%M-%S")
-    deal_folder = DEALS_DIRECTORY / folder_name
+    created_at = created_at or datetime.now()
+    folder_name = f"Телеграмм {created_at.strftime('%d.%m')} - {created_at.strftime('%H:%M')}"
+    deal_folder = unique_directory_path(DEALS_DIRECTORY, folder_name)
     deal_folder.mkdir(parents=True, exist_ok=False)
-    (deal_folder / "Documents").mkdir()
+    (deal_folder / CHAT_DOCUMENTS_FOLDER_NAME).mkdir()
     with (deal_folder / DEAL_METADATA_FILE).open("w", encoding="utf-8") as file:
         json.dump({"deal_id": deal_id}, file)
     return deal_folder
@@ -79,6 +102,46 @@ def save_chat_deals(chat_deals: dict[str, str]) -> None:
     DATA_DIRECTORY.mkdir(exist_ok=True)
     with CHAT_DEALS_FILE.open("w", encoding="utf-8") as file:
         json.dump(chat_deals, file, ensure_ascii=False, indent=2)
+
+
+def load_notification_chat_id() -> Optional[int]:
+    """Load the private operations chat from env or local runtime data."""
+    configured_id = os.getenv("NOTIFICATIONS_CHAT_ID", "").strip()
+    if configured_id.lstrip("-").isdigit():
+        return int(configured_id)
+    if not NOTIFICATION_CHAT_FILE.exists():
+        return None
+    try:
+        with NOTIFICATION_CHAT_FILE.open(encoding="utf-8") as file:
+            stored_id = str(json.load(file).get("chat_id", ""))
+        return int(stored_id) if stored_id.lstrip("-").isdigit() else None
+    except (OSError, json.JSONDecodeError):
+        logging.warning("Could not read the notification chat settings")
+        return None
+
+
+def save_notification_chat_id(chat_id: int) -> None:
+    DATA_DIRECTORY.mkdir(exist_ok=True)
+    with NOTIFICATION_CHAT_FILE.open("w", encoding="utf-8") as file:
+        json.dump({"chat_id": chat_id}, file, ensure_ascii=False, indent=2)
+
+
+def is_notification_chat(message: Message) -> bool:
+    return load_notification_chat_id() == message.chat.id
+
+
+async def send_notification(bot: Bot, text: str) -> bool:
+    """Send an operational message outside the client chat."""
+    chat_id = load_notification_chat_id()
+    if chat_id is None:
+        logging.warning("Notification chat is not configured: %s", text)
+        return False
+    try:
+        await bot.send_message(chat_id, text)
+        return True
+    except Exception as error:
+        logging.warning("Could not send notification: %s", error)
+        return False
 
 
 def get_deal_id_for_chat(message: Message) -> Optional[str]:
@@ -105,6 +168,16 @@ def find_deal_folder(deal_id: str) -> Optional[Path]:
     return None
 
 
+def documents_directory_for_deal(deal_folder: Path) -> Path:
+    """Use the Russian folder for new deals and retain legacy deal support."""
+    current_directory = deal_folder / CHAT_DOCUMENTS_FOLDER_NAME
+    legacy_directory = deal_folder / LEGACY_DOCUMENTS_FOLDER_NAME
+    if current_directory.exists() or not legacy_directory.exists():
+        current_directory.mkdir(exist_ok=True)
+        return current_directory
+    return legacy_directory
+
+
 def excluded_usernames() -> set[str]:
     """Return normalized usernames whose documents must not be stored."""
     usernames = os.getenv("EXCLUDED_USERNAMES", "")
@@ -128,6 +201,23 @@ def manager_user_id() -> Optional[int]:
     if raw_user_id and raw_user_id.isdigit():
         return int(raw_user_id)
     return None
+
+
+def team_user_ids() -> set[int]:
+    """Return stable Telegram IDs allowed to activate the bot in a group."""
+    configured_ids = {
+        int(value.strip())
+        for value in os.getenv("TEAM_USER_IDS", "").split(",")
+        if value.strip().isdigit()
+    }
+    configured_manager_id = manager_user_id()
+    if configured_manager_id is not None:
+        configured_ids.add(configured_manager_id)
+    return configured_ids
+
+
+def is_authorized_team_user(message: Message) -> bool:
+    return message.from_user is not None and message.from_user.id in team_user_ids()
 
 
 def is_team_member(message: Message) -> bool:
@@ -168,9 +258,97 @@ def unique_file_path(directory: Path, filename: str) -> Path:
         number += 1
 
 
+def exceeds_save_limit(file_size: Optional[int]) -> bool:
+    return file_size is not None and file_size > MAX_SAVE_FILE_BYTES
+
+
+def ocr_skip_reason(file_path: Path, file_size: Optional[int] = None) -> Optional[str]:
+    """Explain why a saved file should bypass OCR."""
+    actual_size = file_size if file_size is not None else file_path.stat().st_size
+    if actual_size > MAX_OCR_FILE_BYTES:
+        return "размер превышает 25 МБ"
+    if file_path.suffix.lower() not in PASSPORT_EXTENSIONS:
+        suffix = file_path.suffix.lower() or "без расширения"
+        return f"формат {suffix} не поддерживает распознавание"
+    if file_path.suffix.lower() != ".pdf":
+        try:
+            with Image.open(file_path) as image:
+                if image.width * image.height > MAX_OCR_IMAGE_PIXELS:
+                    return "изображение превышает 25 мегапикселей"
+        except OSError:
+            return "изображение не удалось прочитать"
+    return None
+
+
+def remove_oversized_download(file_path: Path) -> None:
+    """Remove a just-downloaded file that exceeded the hard storage limit."""
+    try:
+        file_path.unlink(missing_ok=True)
+    except OSError:
+        logging.warning("Could not remove oversized download: %s", file_path)
+
+
+def crop_to_primary_document(image: Image.Image) -> Image.Image:
+    """Crop a small document from a mostly blank scanner page."""
+    source_image = ImageOps.exif_transpose(image).convert("RGB")
+    preview = source_image.convert("L")
+    preview.thumbnail((500, 500), Image.Resampling.LANCZOS)
+    foreground = preview.point(lambda pixel: 255 if pixel < 245 else 0)
+    foreground = foreground.filter(ImageFilter.MaxFilter(9))
+    width, height = foreground.size
+    pixels = foreground.tobytes()
+    visited = bytearray(width * height)
+    largest_component: Optional[tuple[int, int, int, int, int]] = None
+
+    for start_index, pixel in enumerate(pixels):
+        if pixel == 0 or visited[start_index]:
+            continue
+        queue = deque([start_index])
+        visited[start_index] = 1
+        min_x = max_x = start_index % width
+        min_y = max_y = start_index // width
+        component_size = 0
+        while queue:
+            index = queue.popleft()
+            x, y = index % width, index // width
+            component_size += 1
+            min_x, max_x = min(min_x, x), max(max_x, x)
+            min_y, max_y = min(min_y, y), max(max_y, y)
+            for neighbor in (index - 1, index + 1, index - width, index + width):
+                if neighbor < 0 or neighbor >= width * height or visited[neighbor]:
+                    continue
+                neighbor_x = neighbor % width
+                if abs(neighbor_x - x) > 1 or pixels[neighbor] == 0:
+                    continue
+                visited[neighbor] = 1
+                queue.append(neighbor)
+        component = (component_size, min_x, min_y, max_x + 1, max_y + 1)
+        if largest_component is None or component_size > largest_component[0]:
+            largest_component = component
+
+    if largest_component is None or largest_component[0] < width * height * 0.01:
+        return source_image
+    _, left, top, right, bottom = largest_component
+    component_area = (right - left) * (bottom - top)
+    if component_area > width * height * 0.9:
+        return source_image
+
+    scale_x = source_image.width / width
+    scale_y = source_image.height / height
+    padding_x = max(10, int((right - left) * scale_x * 0.04))
+    padding_y = max(10, int((bottom - top) * scale_y * 0.04))
+    crop_box = (
+        max(0, int(left * scale_x) - padding_x),
+        max(0, int(top * scale_y) - padding_y),
+        min(source_image.width, int(right * scale_x) + padding_x),
+        min(source_image.height, int(bottom * scale_y) + padding_y),
+    )
+    return source_image.crop(crop_box)
+
+
 def extract_text_from_image(image: Image.Image) -> str:
     """Read text locally without sending a document to external services."""
-    prepared_image = ImageOps.exif_transpose(image).convert("L")
+    prepared_image = crop_to_primary_document(image).convert("L")
     if prepared_image.width < 2600:
         scale = 2600 / prepared_image.width
         prepared_image = prepared_image.resize(
@@ -241,12 +419,19 @@ def is_snils(text: str) -> bool:
     has_modern_name = "СНИЛС" in normalized_text or (
         "СТРАХОВОЙНОМЕР" in normalized_text and "ЛИЦЕВОГ" in normalized_text
     )
+    has_expanded_name = all(
+        marker in normalized_text
+        for marker in ("СТРАХОВ", "НОМЕР", "ИНДИВИДУАЛ", "ЛИЦЕВОГ", "СЧЕТ")
+    )
     has_older_name = (
         "ПЕНСИОННОГ" in normalized_text
         and "СТРАХОВАН" in normalized_text
         and ("СВИДЕТЕЛ" in normalized_text or "РОСС" in normalized_text)
     )
-    return has_modern_name or has_older_name
+    has_older_header = all(
+        marker in normalized_text for marker in ("СТРАХОВО", "ОБЯЗАТЕЛЬН", "ПЕНСИОННОГ")
+    )
+    return has_modern_name or has_expanded_name or has_older_name or has_older_header
 
 
 def is_2ndfl_certificate(text: str) -> bool:
@@ -285,8 +470,18 @@ def is_birth_certificate(text: str) -> bool:
     return "СВИДЕТЕЛ" in normalized_text and "РОЖДЕН" in normalized_text
 
 
+def is_power_of_attorney(text: str) -> bool:
+    """Identify a power of attorney by its explicit document title."""
+    normalized_text = re.sub(r"[^А-ЯЁ]", "", text.upper())
+    return "ДОВЕРЕННОСТ" in normalized_text
+
+
 def recognized_document_name(text: str) -> Optional[str]:
     """Return a safe, human-readable name for a recognized document type."""
+    # A power of attorney often contains passport details, so its explicit
+    # title must take priority over the embedded identity-document markers.
+    if is_power_of_attorney(text):
+        return "Доверенность"
     if is_russian_passport(text):
         return "Паспорт"
     if is_snils(text):
@@ -323,19 +518,23 @@ def rename_recognized_document(file_path: Path) -> Optional[Path]:
     return destination
 
 
-def is_passport_photo_album(file_paths: list[Path]) -> bool:
-    """Identify a passport by considering all pages in one Telegram album."""
+def recognized_photo_album_name(file_paths: list[Path]) -> Optional[str]:
+    """Classify a multi-page Telegram album using all readable pages together."""
+    text_parts = []
     for file_path in file_paths:
         try:
-            if is_russian_passport(extract_document_text(file_path)):
-                return True
+            text_parts.append(extract_document_text(file_path))
         except (OSError, RuntimeError, fitz.FileDataError, pytesseract.TesseractError) as error:
             logging.warning("Could not read album page %s: %s", file_path.name, error)
-    return False
+    return recognized_document_name("\n".join(text_parts))
 
 
 async def process_photo_album(
-    album_key: tuple[int, str], bot: Bot, documents_directory: Path, deal_id: str
+    album_key: tuple[int, str],
+    bot: Bot,
+    documents_directory: Path,
+    deal_id: str,
+    source_chat_title: str,
 ) -> None:
     """Wait for an album to arrive, then save and recognize its pages together."""
     try:
@@ -345,6 +544,16 @@ async def process_photo_album(
         if not album_photos:
             return
 
+        album_label = f"Альбом из {len(album_photos)} файлов"
+        declared_size = sum(photo.file_size or 0 for _, photo in album_photos)
+        if exceeds_save_limit(declared_size):
+            await send_notification(
+                bot,
+                f'Документ "{album_label}" не сохранён: общий размер превышает 50 МБ\n'
+                f"Чат: {source_chat_title}",
+            )
+            return
+
         saved_paths = []
         for page_number, (_, photo) in enumerate(sorted(album_photos), start=1):
             filename = f"album_{album_key[1]}_page_{page_number}.jpg"
@@ -352,21 +561,50 @@ async def process_photo_album(
             await bot.download(photo, destination=destination)
             saved_paths.append(destination)
 
-        if await asyncio.to_thread(is_passport_photo_album, saved_paths):
+        actual_size = sum(path.stat().st_size for path in saved_paths)
+        if exceeds_save_limit(actual_size):
+            for saved_path in saved_paths:
+                remove_oversized_download(saved_path)
+            await send_notification(
+                bot,
+                f'Документ "{album_label}" не сохранён: общий размер превышает 50 МБ\n'
+                f"Чат: {source_chat_title}",
+            )
+            return
+
+        album_skip_reason = None
+        if actual_size > MAX_OCR_FILE_BYTES:
+            album_skip_reason = "общий размер превышает 25 МБ"
+        elif any(
+            getattr(photo, "width", 0) * getattr(photo, "height", 0) > MAX_OCR_IMAGE_PIXELS
+            for _, photo in album_photos
+        ):
+            album_skip_reason = "одно из изображений превышает 25 мегапикселей"
+
+        document_name = None
+        if album_skip_reason is None:
+            document_name = await asyncio.to_thread(recognized_photo_album_name, saved_paths)
+        if document_name:
             renamed_paths = []
             for page_number, saved_path in enumerate(saved_paths, start=1):
                 destination = unique_file_path(
-                    documents_directory, f"Паспорт {page_number}.jpg"
+                    documents_directory, f"{document_name} {page_number}.jpg"
                 )
                 saved_path.rename(destination)
                 renamed_paths.append(destination)
-            await bot.send_message(
-                album_key[0], f"Паспорт сохранён: {len(renamed_paths)} стр."
+            await send_notification(
+                bot,
+                f"{document_name} сохранён: {len(renamed_paths)} стр.\nЧат: {source_chat_title}",
             )
             for renamed_path in renamed_paths:
                 await asyncio.to_thread(drive_storage.upload_document, deal_id, renamed_path)
         else:
-            await bot.send_message(album_key[0], f"Фотографии сохранены: {len(saved_paths)} шт.")
+            reason = album_skip_reason or "тип документа не определён"
+            await send_notification(
+                bot,
+                f'Документ "{album_label}" сохранён без распознавания: {reason}\n'
+                f"Чат: {source_chat_title}",
+            )
             for saved_path in saved_paths:
                 await asyncio.to_thread(drive_storage.upload_document, deal_id, saved_path)
     except Exception:
@@ -384,8 +622,88 @@ async def queue_photo_album(message: Message, documents_directory: Path, deal_id
     if previous_task:
         previous_task.cancel()
     photo_album_tasks[album_key] = asyncio.create_task(
-        process_photo_album(album_key, message.bot, documents_directory, deal_id)
+        process_photo_album(
+            album_key,
+            message.bot,
+            documents_directory,
+            deal_id,
+            message.chat.title or str(message.chat.id),
+        )
     )
+
+
+async def create_deal_for_chat(message: Message, replace_existing: bool = False) -> Optional[Path]:
+    """Create and link a deal without writing anything in the client chat."""
+    if load_notification_chat_id() is None:
+        logging.error("Cannot create a deal before the notification chat is configured")
+        return None
+
+    existing_deal_id = get_deal_id_for_chat(message)
+    if existing_deal_id and not replace_existing:
+        existing_folder = find_deal_folder(existing_deal_id)
+        if existing_folder:
+            return existing_folder
+
+    created_at = datetime.now()
+    deal_id = create_deal_id()
+    deal_folder = create_deal_folder(deal_id, created_at)
+    chat_deals = load_chat_deals()
+    chat_deals[str(message.chat.id)] = deal_id
+    save_chat_deals(chat_deals)
+    drive_ready = await asyncio.to_thread(
+        drive_storage.ensure_deal_folders, deal_id, deal_folder.name
+    )
+    await send_notification(message.bot, f"Создал папку в {created_at.strftime('%H:%M')}")
+    if drive_storage.enabled and not drive_ready:
+        await send_notification(
+            message.bot,
+            f"Google Drive временно недоступен. Локальная папка сохранена: {deal_folder.name}",
+        )
+    return deal_folder
+
+
+@dp.message(F.new_chat_members)
+async def bot_added_to_chat_handler(message: Message) -> None:
+    """Silently initialize a deal when this bot is added to a client group."""
+    if message.chat.type not in {"group", "supergroup"}:
+        return
+    bot_user = await message.bot.get_me()
+    if not any(member.id == bot_user.id for member in message.new_chat_members):
+        return
+    if is_notification_chat(message):
+        return
+    if not is_authorized_team_user(message):
+        await send_notification(
+            message.bot,
+            f"Бот отклонил добавление в посторонний чат: {message.chat.title or message.chat.id}",
+        )
+        await message.bot.leave_chat(message.chat.id)
+        return
+    await create_deal_for_chat(message)
+
+
+@dp.my_chat_member()
+async def bot_membership_updated_handler(event: ChatMemberUpdated) -> None:
+    """Handle the dedicated Bot API update emitted when this bot joins a chat."""
+    if event.chat.type not in {"group", "supergroup"}:
+        return
+    joined_statuses = {ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR}
+    departed_statuses = {ChatMemberStatus.LEFT, ChatMemberStatus.KICKED}
+    if (
+        event.old_chat_member.status not in departed_statuses
+        or event.new_chat_member.status not in joined_statuses
+    ):
+        return
+    if is_notification_chat(event):
+        return
+    if not is_authorized_team_user(event):
+        await send_notification(
+            event.bot,
+            f"Бот отклонил добавление в посторонний чат: {event.chat.title or event.chat.id}",
+        )
+        await event.bot.leave_chat(event.chat.id)
+        return
+    await create_deal_for_chat(event)
 
 
 @dp.message(CommandStart())
@@ -393,11 +711,22 @@ async def start_handler(message: Message, state: FSMContext) -> None:
     if is_client_private_message(message):
         await offer_feedback(message, state)
         return
-    await message.answer(
-        "Здравствуйте! Я Mortgage AI.\n\n"
-        "Добавьте меня в чат сделки и используйте /start_deal, "
-        "чтобы создать временный номер сделки."
-    )
+    if message.chat.type in {"group", "supergroup"}:
+        return
+    await message.answer("Здравствуйте! Я Mortgage AI.")
+
+
+@dp.message(Command("set_notifications"))
+async def set_notifications_handler(message: Message) -> None:
+    """Bind a private team group as the only operational notification chat."""
+    if (
+        message.chat.type not in {"group", "supergroup"}
+        or message.from_user is None
+        or message.from_user.id != manager_user_id()
+    ):
+        return
+    save_notification_chat_id(message.chat.id)
+    await message.answer("Чат уведомлений подключён.")
 
 
 @dp.message(Command("start_deal"))
@@ -405,17 +734,13 @@ async def start_deal_handler(message: Message, state: FSMContext) -> None:
     if is_client_private_message(message):
         await offer_feedback(message, state)
         return
-    deal_id = create_deal_id()
-    deal_folder = create_deal_folder(deal_id)
-    chat_deals = load_chat_deals()
-    chat_deals[str(message.chat.id)] = deal_id
-    save_chat_deals(chat_deals)
-    drive_ready = await asyncio.to_thread(
-        drive_storage.ensure_deal_folders, deal_id, deal_folder.name
-    )
-    await message.answer(f'Сделка создана. Папка "{deal_folder.name}"')
-    if drive_storage.enabled and not drive_ready:
-        await message.answer("Локальная папка создана. Google Drive временно недоступен.")
+    if (
+        message.chat.type not in {"group", "supergroup"}
+        or not is_authorized_team_user(message)
+        or is_notification_chat(message)
+    ):
+        return
+    await create_deal_for_chat(message, replace_existing=True)
 
 
 @dp.message(Command("my_id"))
@@ -424,6 +749,8 @@ async def my_id_handler(message: Message) -> None:
         return
     if message.from_user is None:
         return
+    if message.chat.type in {"group", "supergroup"} and not is_notification_chat(message):
+        return
     await message.answer(f"Ваш технический Telegram ID: {message.from_user.id}")
 
 
@@ -431,6 +758,8 @@ async def my_id_handler(message: Message) -> None:
 async def rates_handler(message: Message) -> None:
     """Show the latest rate mentions collected from configured channels."""
     if not is_team_member(message):
+        return
+    if message.chat.type in {"group", "supergroup"} and not is_notification_chat(message):
         return
     report = await asyncio.to_thread(
         format_rate_report, news_store.latest_rates(), "Текущая ситуация по ставкам"
@@ -442,6 +771,8 @@ async def rates_handler(message: Message) -> None:
 async def rate_changes_handler(message: Message) -> None:
     """Show rate mentions published during the last seven days."""
     if not is_team_member(message):
+        return
+    if message.chat.type in {"group", "supergroup"} and not is_notification_chat(message):
         return
     report = await asyncio.to_thread(
         format_rate_report, news_store.recent_changes(), "Изменения за последние 7 дней"
@@ -455,9 +786,47 @@ async def feedback_rating_handler(message: Message, state: FSMContext) -> None:
     if rating not in {"1", "2", "3", "4", "5"}:
         await message.answer("Пожалуйста, отправьте одну цифру: 1, 2, 3, 4 или 5.")
         return
-    await state.update_data(rating=rating)
+
+    recipient_id = load_notification_chat_id() or manager_user_id()
+    if recipient_id is None:
+        logging.error("Neither notification chat nor MANAGER_USER_ID is configured")
+        await message.answer("Спасибо! Сейчас отзыв нельзя отправить. Попробуйте позднее.")
+        await state.clear()
+        return
+
+    sender_name = message.from_user.full_name if message.from_user else "Неизвестный пользователь"
+    username = (
+        f" (@{message.from_user.username})"
+        if message.from_user and message.from_user.username
+        else ""
+    )
+    sender_id = message.from_user.id if message.from_user else "неизвестен"
+    notification_text = (
+        "Новый отзыв о работе ипотечной команды\n\n"
+        f"Клиент: {sender_name}{username}\n"
+        f"Telegram ID: {sender_id}\n"
+        "Источник: личный чат с ботом\n"
+        f"Оценка: {rating}/5\n"
+        "Комментарий: не оставлен"
+    )
+    try:
+        notification_message = await message.bot.send_message(recipient_id, notification_text)
+    except Exception as error:
+        logging.warning("Could not send rating notification: %s", error)
+        await message.answer("Спасибо! Сейчас отзыв нельзя отправить. Попробуйте позднее.")
+        await state.clear()
+        return
+
+    await state.update_data(
+        rating=rating,
+        feedback_recipient_id=recipient_id,
+        feedback_message_id=notification_message.message_id,
+        feedback_notification_text=notification_text,
+    )
     await state.set_state(Feedback.waiting_for_comment)
-    await message.answer("Спасибо. Напишите, пожалуйста, ваш комментарий или пожелание.")
+    await message.answer(
+        "Спасибо! Оценка уже отправлена. Если хотите, напишите комментарий или пожелание."
+    )
 
 
 @dp.message(Feedback.waiting_for_comment, F.text)
@@ -467,25 +836,29 @@ async def feedback_comment_handler(message: Message, state: FSMContext) -> None:
         await message.answer("Пожалуйста, напишите комментарий текстом.")
         return
 
-    recipient_id = manager_user_id()
-    if recipient_id is None:
-        logging.error("MANAGER_USER_ID is not configured")
-        await message.answer("Спасибо! Сейчас отзыв нельзя отправить. Попробуйте позднее.")
-        await state.clear()
-        return
-
     feedback_data = await state.get_data()
-    sender_name = message.from_user.full_name if message.from_user else "Неизвестный пользователь"
-    username = f" (@{message.from_user.username})" if message.from_user and message.from_user.username else ""
-    await message.bot.send_message(
-        recipient_id,
-        "Новый отзыв о работе ипотечной команды\n\n"
-        f"От: {sender_name}{username}\n"
-        f"Оценка: {feedback_data['rating']}/5\n"
-        f"Комментарий: {comment}",
-    )
+    recipient_id = feedback_data.get("feedback_recipient_id")
+    notification_message_id = feedback_data.get("feedback_message_id")
+    notification_text = feedback_data.get("feedback_notification_text", "")
+    updated_text = notification_text.rsplit("\nКомментарий:", 1)[0] + f"\nКомментарий: {comment}"
+    try:
+        if recipient_id is None or notification_message_id is None:
+            raise RuntimeError("Rating notification metadata is missing")
+        await message.bot.edit_message_text(
+            chat_id=recipient_id,
+            message_id=notification_message_id,
+            text=updated_text,
+        )
+    except Exception as error:
+        logging.warning("Could not update rating notification: %s", error)
+        fallback_recipient_id = recipient_id or load_notification_chat_id() or manager_user_id()
+        if fallback_recipient_id is not None:
+            await message.bot.send_message(
+                fallback_recipient_id,
+                updated_text or f"Комментарий к отзыву: {comment}",
+            )
     await state.clear()
-    await message.answer("Спасибо за отзыв! Он направлен в отдел контроля качества.")
+    await message.answer("Спасибо за комментарий! Отзыв дополнен.")
 
 
 @dp.message(F.document)
@@ -499,27 +872,57 @@ async def document_handler(message: Message) -> None:
 
     deal_id = get_deal_id_for_chat(message)
     if not deal_id:
-        await message.answer("Сначала создайте сделку в этом чате: /start_deal")
+        await send_notification(
+            message.bot,
+            f"Документ не сохранён: для чата {message.chat.title or message.chat.id} нет папки сделки.",
+        )
         return
 
     document = message.document
     if document is None:
         return
+    original_filename = Path(document.file_name or "document").name or "document"
+    if exceeds_save_limit(getattr(document, "file_size", None)):
+        await send_notification(
+            message.bot,
+            f'Документ "{original_filename}" не сохранён: размер превышает 50 МБ\n'
+            f"Чат: {message.chat.title or message.chat.id}",
+        )
+        return
     deal_folder = find_deal_folder(deal_id)
     if not deal_folder:
-        await message.answer("Папка этой сделки не найдена. Создайте новую сделку: /start_deal")
+        await send_notification(
+            message.bot,
+            f"Документ не сохранён: папка сделки для чата {message.chat.title or message.chat.id} не найдена.",
+        )
         return
-    documents_directory = deal_folder / "Documents"
-    documents_directory.mkdir(exist_ok=True)
-    destination = unique_file_path(documents_directory, document.file_name or "document")
+    documents_directory = documents_directory_for_deal(deal_folder)
+    destination = unique_file_path(documents_directory, original_filename)
     await message.bot.download(document, destination=destination)
-    renamed_path = await asyncio.to_thread(rename_recognized_document, destination)
+    actual_size = destination.stat().st_size
+    if exceeds_save_limit(actual_size):
+        remove_oversized_download(destination)
+        await send_notification(
+            message.bot,
+            f'Документ "{original_filename}" не сохранён: размер превышает 50 МБ\n'
+            f"Чат: {message.chat.title or message.chat.id}",
+        )
+        return
+    skip_reason = ocr_skip_reason(destination, actual_size)
+    renamed_path = None
+    if skip_reason is None:
+        renamed_path = await asyncio.to_thread(rename_recognized_document, destination)
     saved_path = renamed_path or destination
     uploaded = await asyncio.to_thread(drive_storage.upload_document, deal_id, saved_path)
-    response = f"Документ сохранён: {saved_path.name}"
+    if renamed_path:
+        response = f"Документ сохранён: {saved_path.name}"
+    else:
+        reason = skip_reason or "тип документа не определён"
+        response = f'Документ "{saved_path.name}" сохранён без распознавания: {reason}'
+    response += f"\nЧат: {message.chat.title or message.chat.id}"
     if drive_storage.enabled:
         response += "\nКопия загружена в Google Drive." if uploaded else "\nЛокальная копия сохранена; Google Drive временно недоступен."
-    await message.answer(response)
+    await send_notification(message.bot, response)
 
 
 @dp.message(F.photo)
@@ -533,30 +936,59 @@ async def photo_handler(message: Message) -> None:
 
     deal_id = get_deal_id_for_chat(message)
     if not deal_id:
-        await message.answer("Сначала создайте сделку в этом чате: /start_deal")
+        await send_notification(
+            message.bot,
+            f"Фотография не сохранена: для чата {message.chat.title or message.chat.id} нет папки сделки.",
+        )
         return
 
     photo = message.photo[-1]
+    filename = f"photo_{datetime.now().strftime('%Y%m%d-%H%M%S')}.jpg"
+    if exceeds_save_limit(getattr(photo, "file_size", None)):
+        await send_notification(
+            message.bot,
+            f'Документ "{filename}" не сохранён: размер превышает 50 МБ\n'
+            f"Чат: {message.chat.title or message.chat.id}",
+        )
+        return
     deal_folder = find_deal_folder(deal_id)
     if not deal_folder:
-        await message.answer("Папка этой сделки не найдена. Создайте новую сделку: /start_deal")
+        await send_notification(
+            message.bot,
+            f"Фотография не сохранена: папка сделки для чата {message.chat.title or message.chat.id} не найдена.",
+        )
         return
-    documents_directory = deal_folder / "Documents"
-    documents_directory.mkdir(exist_ok=True)
+    documents_directory = documents_directory_for_deal(deal_folder)
     if message.media_group_id:
         await queue_photo_album(message, documents_directory, deal_id)
         return
 
-    filename = f"photo_{datetime.now().strftime('%Y%m%d-%H%M%S')}.jpg"
     destination = unique_file_path(documents_directory, filename)
     await message.bot.download(photo, destination=destination)
-    renamed_path = await asyncio.to_thread(rename_recognized_document, destination)
+    actual_size = destination.stat().st_size
+    if exceeds_save_limit(actual_size):
+        remove_oversized_download(destination)
+        await send_notification(
+            message.bot,
+            f'Документ "{filename}" не сохранён: размер превышает 50 МБ\n'
+            f"Чат: {message.chat.title or message.chat.id}",
+        )
+        return
+    skip_reason = ocr_skip_reason(destination, actual_size)
+    renamed_path = None
+    if skip_reason is None:
+        renamed_path = await asyncio.to_thread(rename_recognized_document, destination)
     saved_path = renamed_path or destination
     uploaded = await asyncio.to_thread(drive_storage.upload_document, deal_id, saved_path)
-    response = f"Фотография сохранена: {saved_path.name}"
+    if renamed_path:
+        response = f"Документ сохранён: {saved_path.name}"
+    else:
+        reason = skip_reason or "тип документа не определён"
+        response = f'Документ "{saved_path.name}" сохранён без распознавания: {reason}'
+    response += f"\nЧат: {message.chat.title or message.chat.id}"
     if drive_storage.enabled:
         response += "\nКопия загружена в Google Drive." if uploaded else "\nЛокальная копия сохранена; Google Drive временно недоступен."
-    await message.answer(response)
+    await send_notification(message.bot, response)
 
 
 @dp.message(F.text)

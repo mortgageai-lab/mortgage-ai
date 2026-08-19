@@ -18,6 +18,7 @@ from googleapiclient.errors import HttpError
 
 
 DRIVE_FILE_SCOPE = "https://www.googleapis.com/auth/drive.file"
+CHAT_DOCUMENTS_FOLDER_NAME = "Документы из чата"
 
 
 class GoogleDriveStorage:
@@ -105,7 +106,7 @@ class GoogleDriveStorage:
             if deal_id in deals:
                 return True
             deal_folder_id = self._create_folder(deal_name, self._root_folder_id())
-            documents_folder_id = self._create_folder("Documents", deal_folder_id)
+            documents_folder_id = self._create_folder(CHAT_DOCUMENTS_FOLDER_NAME, deal_folder_id)
             deals[deal_id] = {
                 "deal_folder_id": deal_folder_id,
                 "documents_folder_id": documents_folder_id,
@@ -117,7 +118,7 @@ class GoogleDriveStorage:
             return False
 
     def upload_document(self, deal_id: str, file_path: Path) -> bool:
-        """Upload the final local filename to the deal's Documents folder."""
+        """Upload the final local filename to the deal's chat-documents folder."""
         if not self.enabled:
             return False
         try:
