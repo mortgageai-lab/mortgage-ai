@@ -6,12 +6,12 @@ import logging
 import os
 import re
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 from uuid import uuid4
 
-import fitz
+import pymupdf as fitz
 import pytesseract
 from aiogram import Bot, Dispatcher
 from aiogram import F
@@ -35,6 +35,7 @@ DEALS_DIRECTORY = PROJECT_DIRECTORY / "Deals"
 DATA_DIRECTORY = PROJECT_DIRECTORY / "data"
 CHAT_DEALS_FILE = DATA_DIRECTORY / "chat_deals.json"
 NOTIFICATION_CHAT_FILE = DATA_DIRECTORY / "notification_chat.json"
+FEEDBACK_RATE_LIMIT_FILE = DATA_DIRECTORY / "feedback_rate_limits.json"
 NEWS_DATABASE_FILE = DATA_DIRECTORY / "mortgage_news.sqlite3"
 DEAL_METADATA_FILE = ".mortgage_ai_deal.json"
 CHAT_DOCUMENTS_FOLDER_NAME = "Документы из чата"
@@ -45,6 +46,8 @@ OCR_TIMEOUT_SECONDS = 12
 MAX_OCR_FILE_BYTES = 25 * 1024 * 1024
 MAX_SAVE_FILE_BYTES = 50 * 1024 * 1024
 MAX_OCR_IMAGE_PIXELS = 25_000_000
+MAX_FEEDBACKS_PER_WINDOW = 3
+FEEDBACK_RATE_LIMIT_WINDOW = timedelta(hours=24)
 photo_album_buffers: dict[tuple[int, str], list[tuple[int, object]]] = {}
 photo_album_tasks: dict[tuple[int, str], asyncio.Task[None]] = {}
 news_store = NewsStore(NEWS_DATABASE_FILE)
@@ -124,6 +127,46 @@ def save_notification_chat_id(chat_id: int) -> None:
     DATA_DIRECTORY.mkdir(exist_ok=True)
     with NOTIFICATION_CHAT_FILE.open("w", encoding="utf-8") as file:
         json.dump({"chat_id": chat_id}, file, ensure_ascii=False, indent=2)
+
+
+def load_recent_feedbacks(now: Optional[datetime] = None) -> dict[str, list[float]]:
+    """Load feedback timestamps and discard entries older than 24 hours."""
+    now = now or datetime.now()
+    cutoff = (now - FEEDBACK_RATE_LIMIT_WINDOW).timestamp()
+    if not FEEDBACK_RATE_LIMIT_FILE.exists():
+        return {}
+    try:
+        with FEEDBACK_RATE_LIMIT_FILE.open(encoding="utf-8") as file:
+            stored_feedbacks = json.load(file)
+        return {
+            str(user_id): [
+                float(timestamp)
+                for timestamp in timestamps
+                if isinstance(timestamp, (int, float)) and float(timestamp) > cutoff
+            ]
+            for user_id, timestamps in stored_feedbacks.items()
+            if isinstance(timestamps, list)
+        }
+    except (OSError, json.JSONDecodeError, AttributeError, TypeError, ValueError):
+        logging.warning("Could not read feedback rate limits")
+        return {}
+
+
+def save_recent_feedbacks(feedbacks: dict[str, list[float]]) -> None:
+    DATA_DIRECTORY.mkdir(exist_ok=True)
+    with FEEDBACK_RATE_LIMIT_FILE.open("w", encoding="utf-8") as file:
+        json.dump(feedbacks, file, ensure_ascii=False, indent=2)
+
+
+def feedback_limit_reached(user_id: int, now: Optional[datetime] = None) -> bool:
+    return len(load_recent_feedbacks(now).get(str(user_id), [])) >= MAX_FEEDBACKS_PER_WINDOW
+
+
+def record_feedback(user_id: int, now: Optional[datetime] = None) -> None:
+    now = now or datetime.now()
+    feedbacks = load_recent_feedbacks(now)
+    feedbacks.setdefault(str(user_id), []).append(now.timestamp())
+    save_recent_feedbacks(feedbacks)
 
 
 def is_notification_chat(message: Message) -> bool:
@@ -787,9 +830,20 @@ async def feedback_rating_handler(message: Message, state: FSMContext) -> None:
         await message.answer("Пожалуйста, отправьте одну цифру: 1, 2, 3, 4 или 5.")
         return
 
-    recipient_id = load_notification_chat_id() or manager_user_id()
+    if message.from_user is None:
+        await message.answer("Спасибо! Сейчас отзыв нельзя отправить. Попробуйте позднее.")
+        await state.clear()
+        return
+    if feedback_limit_reached(message.from_user.id):
+        await message.answer(
+            "Спасибо! Ваши отзывы уже отправлены. Следующий отзыв можно будет оставить позднее."
+        )
+        await state.clear()
+        return
+
+    recipient_id = manager_user_id()
     if recipient_id is None:
-        logging.error("Neither notification chat nor MANAGER_USER_ID is configured")
+        logging.error("MANAGER_USER_ID is not configured for private feedback")
         await message.answer("Спасибо! Сейчас отзыв нельзя отправить. Попробуйте позднее.")
         await state.clear()
         return
@@ -816,6 +870,8 @@ async def feedback_rating_handler(message: Message, state: FSMContext) -> None:
         await message.answer("Спасибо! Сейчас отзыв нельзя отправить. Попробуйте позднее.")
         await state.clear()
         return
+
+    record_feedback(message.from_user.id)
 
     await state.update_data(
         rating=rating,
@@ -851,7 +907,7 @@ async def feedback_comment_handler(message: Message, state: FSMContext) -> None:
         )
     except Exception as error:
         logging.warning("Could not update rating notification: %s", error)
-        fallback_recipient_id = recipient_id or load_notification_chat_id() or manager_user_id()
+        fallback_recipient_id = recipient_id or manager_user_id()
         if fallback_recipient_id is not None:
             await message.bot.send_message(
                 fallback_recipient_id,

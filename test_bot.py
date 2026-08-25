@@ -1,7 +1,7 @@
 import json
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -298,6 +298,21 @@ class SilentChatTests(unittest.IsolatedAsyncioTestCase):
 
 
 class FeedbackTests(unittest.IsolatedAsyncioTestCase):
+    def test_fourth_feedback_is_blocked_until_24_hour_window_expires(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rate_limit_file = Path(directory) / "feedback_rate_limits.json"
+            start = datetime(2026, 8, 25, 12, 0)
+            with patch.object(bot, "FEEDBACK_RATE_LIMIT_FILE", rate_limit_file), patch.object(
+                bot, "DATA_DIRECTORY", Path(directory)
+            ):
+                for offset in range(3):
+                    bot.record_feedback(555, start + timedelta(minutes=offset))
+
+                self.assertTrue(bot.feedback_limit_reached(555, start + timedelta(hours=1)))
+                self.assertFalse(
+                    bot.feedback_limit_reached(555, start + timedelta(hours=24, minutes=1))
+                )
+
     async def test_rating_is_reported_immediately_with_client_identity(self):
         telegram_bot = SimpleNamespace(
             send_message=AsyncMock(return_value=SimpleNamespace(message_id=321))
@@ -314,15 +329,38 @@ class FeedbackTests(unittest.IsolatedAsyncioTestCase):
             clear=AsyncMock(),
         )
 
-        with patch.object(bot, "load_notification_chat_id", return_value=-1001):
+        with patch.object(bot, "manager_user_id", return_value=1680647231), patch.object(
+            bot, "load_notification_chat_id", return_value=-1001
+        ), patch.object(bot, "feedback_limit_reached", return_value=False), patch.object(
+            bot, "record_feedback"
+        ) as record_feedback:
             await bot.feedback_rating_handler(message, state)
 
+        self.assertEqual(telegram_bot.send_message.await_args.args[0], 1680647231)
         sent_text = telegram_bot.send_message.await_args.args[1]
         self.assertIn("Оценка: 1/5", sent_text)
         self.assertIn("Тестовый клиент (@client)", sent_text)
         self.assertIn("Telegram ID: 555", sent_text)
         state.update_data.assert_awaited_once()
         state.set_state.assert_awaited_once_with(bot.Feedback.waiting_for_comment)
+        record_feedback.assert_called_once_with(555)
+
+    async def test_fourth_rating_is_not_sent_to_manager(self):
+        telegram_bot = SimpleNamespace(send_message=AsyncMock())
+        message = SimpleNamespace(
+            text="5",
+            from_user=SimpleNamespace(id=555, username="client", full_name="Клиент"),
+            bot=telegram_bot,
+            answer=AsyncMock(),
+        )
+        state = SimpleNamespace(clear=AsyncMock())
+
+        with patch.object(bot, "feedback_limit_reached", return_value=True):
+            await bot.feedback_rating_handler(message, state)
+
+        telegram_bot.send_message.assert_not_awaited()
+        message.answer.assert_awaited_once()
+        state.clear.assert_awaited_once()
 
     async def test_comment_updates_existing_rating_notification(self):
         telegram_bot = SimpleNamespace(
