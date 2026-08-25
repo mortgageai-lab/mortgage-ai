@@ -16,6 +16,7 @@ outputs/
 *.session-journal
 
 # Python virtual environments and generated files
+.DS_Store
 .venv/
 .venv-*/
 __pycache__/
