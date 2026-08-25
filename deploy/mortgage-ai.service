@@ -1,0 +1,24 @@
+[Unit]
+Description=Mortgage AI Telegram bot
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=mortgageai
+Group=mortgageai
+WorkingDirectory=/opt/mortgage-ai
+ExecStart=/opt/mortgage-ai/.venv/bin/python /opt/mortgage-ai/bot.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/mortgage-ai
+
+[Install]
+WantedBy=multi-user.target

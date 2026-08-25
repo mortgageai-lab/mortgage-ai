@@ -193,6 +193,23 @@ OCR и русский языковой пакет (`rus`).
 Google Drive. Если Drive временно недоступен, клиентский документ остаётся на
 сервере, а бот честно сообщает об этом в чате.
 
+## Автозапуск на сервере
+
+Готовый unit находится в `deploy/mortgage-ai.service`. Он запускает бот от
+отдельного пользователя `mortgageai`, автоматически перезапускает процесс при
+сбое и применяет закрытую маску файлов `0077`. Установка выполняется от root:
+
+```bash
+cp /opt/mortgage-ai/deploy/mortgage-ai.service /etc/systemd/system/mortgage-ai.service
+systemctl daemon-reload
+systemctl enable --now mortgage-ai.service
+systemctl status mortgage-ai.service
+```
+
+Логи доступны через `journalctl -u mortgage-ai.service`. Перед включением
+службы ручной `python bot.py` должен быть остановлен, иначе два процесса будут
+конфликтовать за один Telegram-токен.
+
 ### Состояние на 19 августа 2026
 
 Предыдущая серверная версия успешно прошла тест Google Drive. На время локальной
